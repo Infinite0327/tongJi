@@ -1,6 +1,5 @@
 import argparse
 import json
-import math
 import re
 import sys
 import zipfile
@@ -9,47 +8,78 @@ from xml.etree import ElementTree as ET
 
 import numpy as np
 import pandas as pd
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import accuracy_score, average_precision_score, roc_auc_score
+from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import MinMaxScaler, OneHotEncoder
+from sklearn.svm import LinearSVC
 
 
 RANDOM_STATE = 42
-TARGET_COLUMN = "宫内妊娠术后3-4周（胎心胎芽1）"
+TARGET_COLUMN = "\u5bab\u5185\u598a\u5a20\u672f\u540e3-4\u5468\uff08\u80ce\u5fc3\u80ce\u82bd1\uff09"
 DEFAULT_EXCEL_PATHS = [
-    Path("病历原始数据.xlsx"),
-    Path("超声数据") / "病历原始数据.xlsx",
+    Path("\u75c5\u5386\u539f\u59cb\u6570\u636e.xlsx"),
+    Path("\u8d85\u58f0\u6570\u636e") / "\u75c5\u5386\u539f\u59cb\u6570\u636e.xlsx",
 ]
 
 LEAKAGE_KEYWORDS = [
     "id",
-    "编号",
-    "序号",
-    "病案",
-    "病历",
-    "住院号",
-    "门诊号",
-    "姓名",
-    "名字",
+    "\u7f16\u53f7",
+    "\u5e8f\u53f7",
+    "\u75c5\u6848",
+    "\u75c5\u5386",
+    "\u4f4f\u9662\u53f7",
+    "\u95e8\u8bca\u53f7",
+    "\u59d3\u540d",
+    "\u540d\u5b57",
     "name",
-    "电话",
-    "身份证",
-    "标签",
+    "\u7535\u8bdd",
+    "\u8eab\u4efd\u8bc1",
+    "\u6807\u7b7e",
     "label",
     "target",
-    "妊娠",
-    "结局",
-    "结果",
-    "术后",
+    "\u598a\u5a20",
+    "\u7ed3\u5c40",
+    "\u7ed3\u679c",
+    "\u672f\u540e",
     "hcg",
-    "β",
+    "\u03b2",
     "beta",
-    "胎心",
-    "胎芽",
-    "流产",
-    "活产",
-    "生化",
+    "\u80ce\u5fc3",
+    "\u80ce\u82bd",
+    "\u6d41\u4ea7",
+    "\u6d3b\u4ea7",
+    "\u751f\u5316",
 ]
 
-MISSING_MARKERS = {"", "-", "—", "–", "NA", "N/A", "nan", "NaN", "无"}
+MISSING_MARKERS = {"", "-", "\u2014", "\u2013", "NA", "N/A", "nan", "NaN", "\u65e0"}
+C_GRID = [0.001, 0.01, 0.1, 1.0, 10.0, 100.0]
+MIN_CATEGORY_COUNT = 3
 MIN_NUMERIC_COVERAGE = 0.95
+
+
+class RareCategoryGrouper(BaseEstimator, TransformerMixin):
+    def __init__(self, min_count=3):
+        self.min_count = min_count
+
+    def fit(self, x, y=None):
+        frame = pd.DataFrame(x).astype(str)
+        self.keep_values_ = []
+        for column in frame.columns:
+            counts = frame[column].value_counts(dropna=False)
+            keep = set(counts[counts >= self.min_count].index)
+            self.keep_values_.append(keep)
+        return self
+
+    def transform(self, x):
+        frame = pd.DataFrame(x).astype(str).copy()
+        for i, column in enumerate(frame.columns):
+            keep = self.keep_values_[i]
+            frame[column] = frame[column].where(frame[column].isin(keep), "__RARE__")
+        return frame.to_numpy(dtype=object)
 
 
 def find_excel_path(cli_path):
@@ -63,9 +93,7 @@ def find_excel_path(cli_path):
         if path.exists():
             return path
 
-    raise FileNotFoundError(
-        "Could not find 病历原始数据.xlsx in the project root or 超声数据/."
-    )
+    raise FileNotFoundError("Could not find the Excel file.")
 
 
 def col_to_index(cell_ref):
@@ -112,8 +140,7 @@ def read_xlsx_without_openpyxl(path):
         if target is None:
             raise ValueError("Could not resolve first worksheet relationship.")
 
-        sheet_path = Path("xl") / target
-        sheet_path = str(sheet_path).replace("\\", "/")
+        sheet_path = str(Path("xl") / target).replace("\\", "/")
         sheet_xml = ET.fromstring(zf.read(sheet_path))
 
         rows = []
@@ -182,8 +209,27 @@ def label_to_binary(series):
         if set(unique).issubset({0, 1}):
             return numeric.astype(int)
 
-    positive_tokens = ["1", "是", "有", "成功", "阳性", "妊娠", "怀孕", "临床妊娠", "见胎心"]
-    negative_tokens = ["0", "否", "无", "失败", "阴性", "未妊娠", "未孕", "未见"]
+    positive_tokens = [
+        "1",
+        "\u662f",
+        "\u6709",
+        "\u6210\u529f",
+        "\u9633\u6027",
+        "\u598a\u5a20",
+        "\u6000\u5b55",
+        "\u4e34\u5e8a\u598a\u5a20",
+        "\u89c1\u80ce\u5fc3",
+    ]
+    negative_tokens = [
+        "0",
+        "\u5426",
+        "\u65e0",
+        "\u5931\u8d25",
+        "\u9634\u6027",
+        "\u672a\u598a\u5a20",
+        "\u672a\u5b55",
+        "\u672a\u89c1",
+    ]
 
     def convert(value):
         if pd.isna(value):
@@ -206,62 +252,102 @@ def label_to_binary(series):
 
 def is_leakage_or_identifier(column):
     normalized = normalize_column_name(column)
+    if normalized.startswith("unnamed:"):
+        return True
     if is_target_column(column):
         return True
     return any(keyword.lower() in normalized for keyword in LEAKAGE_KEYWORDS)
 
 
+def replace_missing_markers(series):
+    return series.replace(list(MISSING_MARKERS), np.nan)
+
+
 def coerce_numeric_series(series):
-    cleaned = series.replace(list(MISSING_MARKERS), np.nan)
-    return pd.to_numeric(cleaned, errors="coerce")
+    return pd.to_numeric(replace_missing_markers(series), errors="coerce")
 
 
-def numeric_candidate_columns(df):
-    candidates = []
+def split_feature_columns(df):
+    numeric_features = []
+    categorical_features = []
     excluded = []
+
     for column in df.columns:
         if is_leakage_or_identifier(column):
             excluded.append((column, "identifier/label/outcome leakage keyword"))
             continue
 
-        converted = coerce_numeric_series(df[column])
-        original_non_missing = df[column].replace(list(MISSING_MARKERS), np.nan).notna().sum()
-        numeric_non_null = converted.notna().sum()
-        coverage = numeric_non_null / len(df) if len(df) else 0.0
-        if original_non_missing > 0 and numeric_non_null == original_non_missing and coverage >= MIN_NUMERIC_COVERAGE:
-            candidates.append(column)
+        cleaned = replace_missing_markers(df[column])
+        non_missing = int(cleaned.notna().sum())
+        if non_missing == 0:
+            excluded.append((column, "empty"))
+            continue
+
+        numeric = pd.to_numeric(cleaned, errors="coerce")
+        numeric_non_missing = int(numeric.notna().sum())
+        numeric_coverage = numeric_non_missing / len(df) if len(df) else 0.0
+        if numeric_non_missing == non_missing and numeric_coverage >= MIN_NUMERIC_COVERAGE:
+            numeric_features.append(column)
+        elif numeric_non_missing == non_missing:
+            excluded.append((column, "numeric but low coverage"))
         else:
-            excluded.append((column, "non-numeric, low numeric coverage, or partially non-numeric"))
-    return candidates, excluded
+            categorical_features.append(column)
+
+    return numeric_features, categorical_features, excluded
 
 
-def write_columns_preview(path, candidates, excluded):
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("候选数值特征列（已排除 ID、姓名、标签、结局、HCG 等泄漏列）:\n")
-        for i, column in enumerate(candidates, 1):
-            f.write(f"{i}. {column}\n")
-        f.write("\n被排除列:\n")
-        for column, reason in excluded:
-            f.write(f"- {column}: {reason}\n")
+def make_one_hot_encoder():
+    try:
+        return OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+    except TypeError:
+        return OneHotEncoder(handle_unknown="ignore", sparse=False)
 
 
-def minmax_transform(train_values, test_values):
-    min_values = np.nanmin(train_values, axis=0)
-    max_values = np.nanmax(train_values, axis=0)
-    ranges = max_values - min_values
-    ranges[ranges == 0] = 1.0
-    return (train_values - min_values) / ranges, (test_values - min_values) / ranges
+def build_pipeline(numeric_features, categorical_features, c_value):
+    numeric_pipeline = Pipeline(
+        steps=[
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", MinMaxScaler(clip=True)),
+        ]
+    )
+    categorical_pipeline = Pipeline(
+        steps=[
+            ("imputer", SimpleImputer(strategy="constant", fill_value="__MISSING__")),
+            ("rare", RareCategoryGrouper(min_count=MIN_CATEGORY_COUNT)),
+            ("onehot", make_one_hot_encoder()),
+        ]
+    )
+
+    transformers = []
+    if numeric_features:
+        transformers.append(("num", numeric_pipeline, numeric_features))
+    if categorical_features:
+        transformers.append(("cat", categorical_pipeline, categorical_features))
+
+    preprocess = ColumnTransformer(transformers=transformers, remainder="drop")
+    return Pipeline(
+        steps=[
+            ("preprocess", preprocess),
+            ("svm", LinearSVC(C=c_value, random_state=RANDOM_STATE, max_iter=50000)),
+        ]
+    )
 
 
-def median_impute_from_train(train_values, test_values):
-    medians = np.nanmedian(train_values, axis=0)
-    if np.isnan(medians).any():
-        bad_columns = np.where(np.isnan(medians))[0].tolist()
-        raise ValueError(f"Cannot impute columns with all-missing training values: {bad_columns}")
+def transformed_feature_names(best_model, numeric_features, categorical_features):
+    names = []
+    names.extend(numeric_features)
 
-    train_filled = np.where(np.isnan(train_values), medians, train_values)
-    test_filled = np.where(np.isnan(test_values), medians, test_values)
-    return train_filled, test_filled
+    if categorical_features:
+        preprocessor = best_model.named_steps["preprocess"]
+        cat_pipeline = preprocessor.named_transformers_["cat"]
+        onehot = cat_pipeline.named_steps["onehot"]
+        try:
+            encoded = onehot.get_feature_names_out(categorical_features)
+        except AttributeError:
+            encoded = onehot.get_feature_names(categorical_features)
+        names.extend([str(name) for name in encoded])
+
+    return names
 
 
 def save_txt(path, x_values, y_values):
@@ -269,9 +355,69 @@ def save_txt(path, x_values, y_values):
     np.savetxt(path, data, fmt="%.10g")
 
 
+def best_threshold_for_accuracy(scores, y_true):
+    order = np.argsort(scores)
+    sorted_scores = scores[order]
+    thresholds = [sorted_scores[0] - 1.0]
+    thresholds.extend(((sorted_scores[:-1] + sorted_scores[1:]) / 2.0).tolist())
+    thresholds.append(sorted_scores[-1] + 1.0)
+
+    best_threshold = 0.0
+    best_accuracy = -1.0
+    for threshold in thresholds:
+        pred = (scores >= threshold).astype(int)
+        acc = accuracy_score(y_true, pred)
+        if acc > best_accuracy:
+            best_accuracy = acc
+            best_threshold = float(threshold)
+
+    return best_threshold, best_accuracy
+
+
+def select_c_and_threshold(x_train, y_train, numeric_features, categorical_features):
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+    results = []
+
+    for c_value in C_GRID:
+        oof_scores = np.zeros(len(y_train), dtype=float)
+        for fold_train_idx, fold_valid_idx in cv.split(x_train, y_train):
+            fold_model = build_pipeline(numeric_features, categorical_features, c_value)
+            fold_model.fit(x_train.iloc[fold_train_idx], y_train[fold_train_idx])
+            oof_scores[fold_valid_idx] = fold_model.decision_function(
+                x_train.iloc[fold_valid_idx]
+            )
+
+        threshold, cv_accuracy = best_threshold_for_accuracy(oof_scores, y_train)
+        results.append(
+            {
+                "C": float(c_value),
+                "threshold": float(threshold),
+                "cv_accuracy": float(cv_accuracy),
+            }
+        )
+
+    best = max(results, key=lambda item: (item["cv_accuracy"], -item["C"]))
+    return best, results
+
+
+def write_selected_features(path, numeric_features, categorical_features, model_features):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("Raw numeric features:\n")
+        for feature in numeric_features:
+            f.write(f"- {feature}\n")
+
+        f.write("\nRaw categorical features:\n")
+        for feature in categorical_features:
+            f.write(f"- {feature}\n")
+
+        f.write("\nExpanded model vector features:\n")
+        for i, feature in enumerate(model_features, 1):
+            f.write(f"{i}. {feature}\n")
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--excel", default=None, help="Path to 病历原始数据.xlsx")
+    parser.add_argument("--excel", default=None, help="Path to the Excel data file")
     args = parser.parse_args()
 
     excel_path = find_excel_path(args.excel)
@@ -293,40 +439,13 @@ def main():
     df = df.loc[usable_mask].reset_index(drop=True)
     y = y.loc[usable_mask].astype(int).to_numpy()
 
-    candidates, excluded = numeric_candidate_columns(df)
-    if len(candidates) != 14:
-        write_columns_preview("columns_preview.txt", candidates, excluded)
-        print(f"Found {len(candidates)} candidate numeric features, not exactly 14.")
-        print("Wrote columns_preview.txt. Please confirm the 14 input features before training.")
-        return 2
+    numeric_features, categorical_features, excluded = split_feature_columns(df)
+    if len(df) < 200:
+        raise ValueError(f"Need at least 200 usable labeled rows for 160/40 split; got {len(df)}.")
+    if not numeric_features and not categorical_features:
+        raise ValueError("No usable non-leakage features found.")
 
-    try:
-        from sklearn.metrics import accuracy_score, average_precision_score, roc_auc_score
-        from sklearn.model_selection import train_test_split
-        from sklearn.svm import LinearSVC
-    except ImportError as exc:
-        raise ImportError(
-            "scikit-learn is required for Linear SVM training and metric calculation. "
-            "Install it with: python -m pip install scikit-learn"
-        ) from exc
-
-    selected_features = candidates
-    with open("selected_features.txt", "w", encoding="utf-8") as f:
-        for feature in selected_features:
-            f.write(f"{feature}\n")
-
-    x_df = df[selected_features].apply(coerce_numeric_series)
-    x = x_df.to_numpy(dtype=float)
-    missing_count = int(np.isnan(x).sum())
-    if missing_count:
-        print(
-            f"Found {missing_count} missing feature values; imputing with training-set medians after split."
-        )
-
-    if len(x_df) < 200:
-        raise ValueError(f"Need at least 200 usable labeled rows for 160/40 split; got {len(x_df)}.")
-
-    indices = np.arange(len(x_df))
+    indices = np.arange(len(df))
     train_idx, test_idx = train_test_split(
         indices,
         train_size=160,
@@ -336,44 +455,79 @@ def main():
         stratify=y if len(np.unique(y)) == 2 and min(np.bincount(y)) >= 2 else None,
     )
 
-    x_train_raw = x[train_idx]
-    x_test_raw = x[test_idx]
+    x = df[numeric_features + categorical_features].copy()
+    for column in numeric_features:
+        x[column] = coerce_numeric_series(x[column])
+    for column in categorical_features:
+        x[column] = replace_missing_markers(x[column]).astype(object)
+
+    x_train = x.iloc[train_idx].reset_index(drop=True)
+    x_test = x.iloc[test_idx].reset_index(drop=True)
     y_train = y[train_idx]
     y_test = y[test_idx]
 
-    x_train_raw, x_test_raw = median_impute_from_train(x_train_raw, x_test_raw)
-    x_train, x_test = minmax_transform(x_train_raw, x_test_raw)
-    x_train = np.clip(x_train, 0.0, 1.0)
-    x_test = np.clip(x_test, 0.0, 1.0)
+    best_search, cv_results = select_c_and_threshold(
+        x_train,
+        y_train,
+        numeric_features,
+        categorical_features,
+    )
+    best_model = build_pipeline(
+        numeric_features,
+        categorical_features,
+        best_search["C"],
+    )
+    best_model.fit(x_train, y_train)
 
-    save_txt("train.txt", x_train, y_train)
-    save_txt("test.txt", x_test, y_test)
+    scores = best_model.decision_function(x_test)
+    y_pred = (scores >= best_search["threshold"]).astype(int)
+    test_accuracy = accuracy_score(y_test, y_pred)
 
-    model = LinearSVC(random_state=RANDOM_STATE, max_iter=10000)
-    model.fit(x_train, y_train)
-    y_pred = model.predict(x_test)
-    scores = model.decision_function(x_test)
+    x_train_vector = best_model.named_steps["preprocess"].transform(x_train)
+    x_test_vector = best_model.named_steps["preprocess"].transform(x_test)
+    x_train_vector = np.asarray(x_train_vector, dtype=float)
+    x_test_vector = np.asarray(x_test_vector, dtype=float)
+
+    save_txt("train.txt", x_train_vector, y_train)
+    save_txt("test.txt", x_test_vector, y_test)
+
+    model_features = transformed_feature_names(best_model, numeric_features, categorical_features)
+    write_selected_features(
+        "selected_features.txt",
+        numeric_features,
+        categorical_features,
+        model_features,
+    )
 
     metrics = {
-        "accuracy": float(accuracy_score(y_test, y_pred)),
+        "model": "LinearSVC",
+        "accuracy": float(test_accuracy),
         "AP": float(average_precision_score(y_test, scores)),
         "AUC": float(roc_auc_score(y_test, scores)),
         "n_train": int(len(train_idx)),
         "n_test": int(len(test_idx)),
         "random_state": RANDOM_STATE,
-        "model": "LinearSVC",
         "target_column": target_column,
-        "selected_features": selected_features,
+        "numeric_feature_count": int(len(numeric_features)),
+        "categorical_feature_count": int(len(categorical_features)),
+        "vector_dim": int(x_train_vector.shape[1]),
+        "numeric_features": numeric_features,
+        "categorical_features": categorical_features,
     }
     with open("metrics.json", "w", encoding="utf-8") as f:
         json.dump(metrics, f, ensure_ascii=False, indent=2)
 
-    print("\n使用的14维特征名:")
-    for i, feature in enumerate(selected_features, 1):
+    print("\nRaw numeric features:")
+    for i, feature in enumerate(numeric_features, 1):
         print(f"{i}. {feature}")
-    print(f"accuracy: {metrics['accuracy']:.6f}")
-    print(f"AP: {metrics['AP']:.6f}")
-    print(f"AUC: {metrics['AUC']:.6f}")
+    print("\nRaw categorical features:")
+    for i, feature in enumerate(categorical_features, 1):
+        print(f"{i}. {feature}")
+    print(f"\nExpanded vector dimension: {x_train_vector.shape[1]}")
+    print(f"Best C selected by train CV accuracy: {best_search['C']}")
+    print(f"Best decision threshold selected by train CV accuracy: {best_search['threshold']:.6f}")
+    print(f"CV accuracy: {best_search['cv_accuracy']:.6f}")
+    print(f"Test accuracy: {test_accuracy:.6f}")
 
     return 0
 

@@ -1,13 +1,16 @@
 {
-  "accuracy": 0.575,
-  "AP": 0.5410676865869843,
-  "AUC": 0.5176767676767677,
+  "model": "LinearSVC",
+  "accuracy": 0.625,
+  "AP": 0.7665750606790209,
+  "AUC": 0.7171717171717171,
   "n_train": 160,
   "n_test": 40,
   "random_state": 42,
-  "model": "LinearSVC",
   "target_column": "宫内妊娠术后3-4周（胎心胎芽1）",
-  "selected_features": [
+  "numeric_feature_count": 14,
+  "categorical_feature_count": 14,
+  "vector_dim": 110,
+  "numeric_features": [
     "年龄",
     "剖宫产史",
     "宫腔操作史有1，无0 ",
@@ -22,5 +25,21 @@
     "基础LH",
     "转化日孕激素水平",
     "不孕年限（年）"
+  ],
+  "categorical_features": [
+    "孕产次",
+    "促排方案",
+    "移植方案",
+    "最终受精方式",
+    "PGT/PGS",
+    "胚胎级别",
+    "输卵管情况",
+    "基础疾病",
+    "精子活力",
+    "不孕因素",
+    "肌壁情况（肌瘤、腺肌瘤）",
+    "多囊病史？",
+    "子宫前位后位？",
+    "内膜模式"
   ]
 }
